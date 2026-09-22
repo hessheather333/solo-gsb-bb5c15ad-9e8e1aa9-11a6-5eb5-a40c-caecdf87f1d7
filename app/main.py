@@ -11,6 +11,7 @@ from fastapi.concurrency import asynccontextmanager
 from pydantic import ValidationError
 
 from . import database
+from .review import solve_review_plan
 from .schemas import (
     OVERRIDABLE_FIELDS,
     AuditEventOut,
@@ -18,6 +19,8 @@ from .schemas import (
     QuotaOut,
     QuotaReservationOut,
     QuotaSetIn,
+    ReviewPlanIn,
+    ReviewPlanOut,
     ReviseTaskIn,
     TaskAuditOut,
     TaskCreated,
@@ -45,9 +48,10 @@ app = FastAPI(
         "面向教研组的题库快照约束组卷服务（FastAPI + SQLite + OR-Tools CP-SAT），"
         "支持 2~5 份平行卷联合组卷、1~5 个差异化候选卷组，"
         "可版本化、创建后不可变的组卷模板，"
-        "以及按题号扣减的题目曝光配额"
+        "按题号扣减的题目曝光配额，"
+        "以及面向已完成且可行任务的盲审分配"
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -295,6 +299,61 @@ def revise_task(task_id: int, payload: ReviseTaskIn) -> TaskCreated:
     )
     submit(new_task_id)
     return TaskCreated(task_id=new_task_id, status="pending")
+
+
+# --------------------------------------------------------------------------- #
+# 盲审分配：为已完成且可行的组卷任务联合分配审阅人（同步求解，不写库）
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/api/tasks/{task_id}/review-plan",
+    response_model=ReviewPlanOut,
+    response_model_exclude_none=True,
+)
+def create_review_plan(task_id: int, payload: ReviewPlanIn) -> ReviewPlanOut:
+    """为已完成且结果可行的组卷任务生成盲审分配方案（同步返回，不产生新任务）。
+
+    在**同一个 CP-SAT 联合模型**中把审阅人分配到源任务的全部卷：每卷恰好
+    `reviewers_per_paper` 名审阅人（同卷不重复）、审阅人回避其不可审卷号、
+    每人跨卷合计不超过其容量。依次最小化：最大个人负载 → 各人负载相对
+    平均值的绝对偏差总和 → 按卷号展平的审阅人编号序列（结果可复现）。
+    无解时返回 `infeasible` 及各卷可用人力与总容量缺口，不返回部分方案。
+    """
+    row = database.get_task(task_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if row["status"] != "done":
+        raise HTTPException(status_code=422, detail="任务尚未完成，无法生成盲审分配方案")
+    if not row["result"]:
+        raise HTTPException(status_code=422, detail="任务尚无结果，无法生成盲审分配方案")
+    result = json.loads(row["result"])
+    if result.get("status") != "feasible":
+        raise HTTPException(status_code=422, detail="任务结果不可行，无法生成盲审分配方案")
+
+    # 卷数取自冻结的源请求（改卷任务溯源到原始组卷请求）
+    req = json.loads(row["request"])
+    if req.get("kind") == "revise":
+        req = req["source_request"]
+    paper_count = int(req.get("paper_count") or 1)
+
+    # 不可审卷号越界校验（卷序号从 0 起，上界为源任务的卷数）
+    for r in payload.reviewers:
+        bad = [p for p in r.excluded_papers if p >= paper_count]
+        if bad:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"审阅人 {r.reviewer_id!r} 的不可审卷号 {bad} 越界："
+                    f"共 {paper_count} 份卷（卷序号 0~{paper_count - 1}）"
+                ),
+            )
+
+    plan = solve_review_plan(
+        [r.model_dump() for r in payload.reviewers],
+        payload.reviewers_per_paper,
+        paper_count,
+        seed=int(row["seed"]),
+    )
+    return ReviewPlanOut(task_id=task_id, **plan)
 
 
 @app.get(

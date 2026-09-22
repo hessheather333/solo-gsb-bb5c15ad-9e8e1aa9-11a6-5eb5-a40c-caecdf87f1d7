@@ -8,6 +8,8 @@
 
 此外支持对已完成且可行的任务**定向改卷**（`POST /api/tasks/{task_id}/revise`）：按卷指定必须保留/移除的题号，联合重求解全部卷并在满足原约束的前提下**最大化各卷保留原题总数**，详见下文[定向改卷](#定向改卷post-apitaskstask_idrevise)。
 
+还提供**盲审分配**（`POST /api/tasks/{task_id}/review-plan`）：为已完成且结果可行的组卷任务把审阅人**联合分配**到各卷——满足同卷不重复、回避（不可审卷号）与总容量约束，并依次最小化**最大个人负载 → 负载相对平均值的绝对偏差总和 → 按卷号展平的审阅人编号序列**，结果可复现；无解时返回各卷可用人力与总容量缺口，绝不返回部分方案，详见下文[盲审分配](#盲审分配post-apitaskstask_idreview-plan)。
+
 还提供**可版本化的组卷模板**（`POST /api/templates`）：把题库无关的约束配置（总分、题型数量、知识点覆盖、难度区间、互斥题组、多卷/候选参数）保存为**创建后不可修改**的模板；用 `POST /api/templates/{template_id}/tasks` 以新的题库快照实例化组卷任务时，可通过白名单 `overrides` 覆盖部分约束，**实际生效配置与 `template_id`/`version` 一并冻结进任务记录**，详见下文[组卷模板](#组卷模板可版本化)。
 
 另提供**题目曝光配额**模块（`PUT /api/quotas`）：按题号设置可用次数；创建任务时声明 `use_quota: true` 后，任务完成可行组卷即在 **SQLite 事务中按题号原子扣减**——并发任务串行化校验，任一题余额不足则整组不扣减、任务返回 `quota_exceeded` 及缺额明细；失败或无解任务不消耗配额，详见下文[题目曝光配额](#题目曝光配额use_quota)。
@@ -47,6 +49,7 @@ EXAM_DB_PATH=./exam.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | `POST` | `/api/tasks` | 创建组卷任务（异步），返回 `task_id`；`use_quota: true` 时启用题目曝光配额 |
 | `POST` | `/api/tasks/{task_id}/revise` | 在已完成且可行的任务上创建**定向改卷**任务（异步） |
+| `POST` | `/api/tasks/{task_id}/review-plan` | 为已完成且可行的任务生成**盲审分配**方案（同步返回，不产生新任务） |
 | `GET`  | `/api/tasks/{task_id}/audit` | 查询任务的**防篡改审计事件链**及重放校验结论（首个断点） |
 | `GET`  | `/api/tasks/{task_id}` | 查询任务状态与结果（启用配额的任务附本次预留及剩余次数） |
 | `POST` | `/api/templates` | 创建组卷模板（不可变）；带 `base_template_id` 时创建该谱系的新版本 |
@@ -386,6 +389,101 @@ curl -X POST http://localhost:8000/api/tasks/42/revise \
   ]
 }
 ```
+
+## 盲审分配（`POST /api/tasks/{task_id}/review-plan`）
+
+为一份**已完成且结果可行**的组卷任务生成盲审分配方案：把审阅人**联合分配**到该任务的全部卷（单卷任务即 1 份卷，多卷/多候选/模板/改卷任务按其冻结的卷数）。分配在**同一个 CP-SAT 联合模型**中求解并**同步返回**——不产生新任务、不写库；同一任务同一请求重复调用结果完全一致（可复现）。
+
+- 源任务仅允许状态为 `done` 且结果为 `feasible`：任务不存在返回 `404`；未完成或结果不可行返回 `422`。
+- 硬约束（全部必须满足，不满足即整体无解）：
+  - 每卷恰好 `reviewers_per_paper` 名审阅人，**同卷审阅人不重复**；
+  - **回避**：审阅人不得分配到其 `excluded_papers` 声明的卷；
+  - **总容量**：每名审阅人跨卷合计分到的卷数不超过其 `capacity`。
+- 择优顺序（字典序，逐层最优后固定再优化下一层）：
+
+  1. **最大个人负载**（单人分到的卷数）最小；
+  2. **各人负载相对平均值的绝对偏差总和**最小（平均负载 = 总分配数 ÷ 审阅人数）；
+  3. **按卷号展平的审阅人编号序列**最小（逐卷把选中审阅人的规范排序编号列表按字典序最小化，唯一破缺对称性，保证可复现）。
+
+### 请求示例
+
+```bash
+curl -X POST http://localhost:8000/api/tasks/42/review-plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "reviewers": [
+      {"reviewer_id": "R1", "capacity": 3, "excluded_papers": [0]},
+      {"reviewer_id": "R2", "capacity": 2, "excluded_papers": []},
+      {"reviewer_id": "R3", "capacity": 2, "excluded_papers": [2]},
+      {"reviewer_id": "R4", "capacity": 3, "excluded_papers": []}
+    ],
+    "reviewers_per_paper": 2
+  }'
+```
+
+字段说明：
+
+- `reviewers`：非空数组，每个元素为一名审阅人：
+  - `reviewer_id`：审阅人编号（数字或字符串），**同一请求内不可重复**（整数 `1` 与字符串 `"1"` 是两个不同的审阅人）；
+  - `capacity`：可承接的最大卷数，**正整数**（非正容量返回 `422`）；
+  - `excluded_papers`：不可审的卷序号（回避关系，从 `0` 起），缺省 `[]`；**越界卷号**（≥ 源任务卷数或为负）返回 `422`。
+- `reviewers_per_paper`：每卷所需审阅人数，**正整数**。
+
+### 可行结果
+
+```json
+{
+  "task_id": 42,
+  "status": "feasible",
+  "paper_count": 3,
+  "reviewers_per_paper": 2,
+  "required_total": 6,
+  "max_load": 2,
+  "assignments": [
+    {"paper": 0, "reviewer_ids": ["R2", "R3"]},
+    {"paper": 1, "reviewer_ids": ["R1", "R2"]},
+    {"paper": 2, "reviewer_ids": ["R1", "R4"]}
+  ],
+  "loads": [
+    {"reviewer_id": "R1", "capacity": 3, "load": 2},
+    {"reviewer_id": "R2", "capacity": 2, "load": 2},
+    {"reviewer_id": "R3", "capacity": 2, "load": 1},
+    {"reviewer_id": "R4", "capacity": 3, "load": 1}
+  ]
+}
+```
+
+- `assignments`：逐卷分配结果（按卷号升序，卷内审阅人按编号规范排序）；
+- `loads`：各人实际负载（不超过其 `capacity`）；`max_load` 为第 1 择优目标的最优值；
+- `required_total`：总分配数（`paper_count × reviewers_per_paper`）。
+
+### 无解结果（不返回部分方案）
+
+无解时**不返回任何分配**，仅给出诊断：各卷可用人力（未回避该卷的审阅人）与总容量缺口：
+
+```json
+{
+  "task_id": 42,
+  "status": "infeasible",
+  "message": "不存在满足全部回避与容量约束的盲审分配方案",
+  "paper_count": 3,
+  "reviewers_per_paper": 2,
+  "required_total": 6,
+  "capacity_total": 2,
+  "capacity_gap": 4,
+  "papers": [
+    {"paper": 0, "required": 2, "available_count": 2,
+     "available_reviewers": ["A", "B"], "shortage": 0},
+    {"paper": 1, "required": 2, "available_count": 2,
+     "available_reviewers": ["A", "B"], "shortage": 0},
+    {"paper": 2, "required": 2, "available_count": 1,
+     "available_reviewers": ["A"], "shortage": 1}
+  ]
+}
+```
+
+- `capacity_total`：审阅人合计可承接卷数（每人按其未回避卷数截断后求和）；`capacity_gap = max(0, required_total - capacity_total)` 为总容量缺口；
+- `papers[i]`：第 `i` 卷的所需人数、可用人数与可用审阅人名单，`shortage` 为该卷人数缺口——总容量充足但分布不均（回避过于集中）时，可据此定位问题卷。
 
 ## 组卷模板（可版本化）
 

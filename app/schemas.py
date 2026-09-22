@@ -602,3 +602,140 @@ class TaskStatus(BaseModel):
         None, description="本次配额预留及剩余次数（仅创建时声明 use_quota 的任务返回）"
     )
     result: Optional[TaskResult] = None
+
+
+# --------------------------------------------------------------------------- #
+# 盲审分配（POST /api/tasks/{task_id}/review-plan）
+# --------------------------------------------------------------------------- #
+ReviewerId = Union[int, str]
+
+
+class ReviewerIn(BaseModel):
+    """一名盲审审阅人：编号、总容量与不可审卷号（回避关系）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reviewer_id: ReviewerId = Field(
+        ..., description="审阅人编号（数字或字符串，同一请求内唯一）"
+    )
+    capacity: int = Field(..., description="可承接的最大卷数（正整数，跨卷合计）")
+    excluded_papers: List[int] = Field(
+        default_factory=list, description="不可审的卷序号（回避关系，从 0 起）"
+    )
+
+    @field_validator("capacity")
+    @classmethod
+    def _capacity_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("capacity 必须为正整数")
+        return v
+
+    @field_validator("excluded_papers")
+    @classmethod
+    def _excluded_non_negative(cls, v: List[int]) -> List[int]:
+        for p in v:
+            if p < 0:
+                raise ValueError("excluded_papers 中的卷序号不能为负数")
+        return v
+
+    @model_validator(mode="after")
+    def _dedupe_excluded(self) -> "ReviewerIn":
+        # 去重（保持首次出现顺序），重复指定同一卷号没有附加语义
+        self.excluded_papers = list(dict.fromkeys(self.excluded_papers))
+        return self
+
+
+class ReviewPlanIn(BaseModel):
+    """盲审分配请求：审阅人名单 + 每卷所需审阅人数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reviewers: List[ReviewerIn] = Field(
+        ..., min_length=1, description="审阅人名单（编号不可重复）"
+    )
+    reviewers_per_paper: int = Field(..., description="每卷所需审阅人数（正整数）")
+
+    @field_validator("reviewers_per_paper")
+    @classmethod
+    def _per_paper_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("reviewers_per_paper 必须为正整数")
+        return v
+
+    @model_validator(mode="after")
+    def _unique_reviewers(self) -> "ReviewPlanIn":
+        # 题号口径与配额一致：整数 1 与字符串 "1" 是两个不同的审阅人
+        seen = set()
+        for r in self.reviewers:
+            key = json.dumps(r.reviewer_id, ensure_ascii=False)
+            if key in seen:
+                raise ValueError(f"审阅人编号 {r.reviewer_id!r} 在请求中重复出现")
+            seen.add(key)
+        return self
+
+
+class ReviewAssignmentOut(BaseModel):
+    """单份卷的盲审分配结果。"""
+
+    paper: int = Field(..., description="卷序号（从 0 起，与组卷结果中的卷下标一致）")
+    reviewer_ids: List[ReviewerId] = Field(
+        ..., description="该卷的审阅人编号（按编号规范排序，同卷不重复）"
+    )
+
+
+class ReviewerLoadOut(BaseModel):
+    """单名审阅人的负载（按编号规范排序返回）。"""
+
+    reviewer_id: ReviewerId
+    capacity: int = Field(..., description="声明的容量上限")
+    load: int = Field(..., description="实际分到的卷数（不超过 capacity）")
+
+
+class ReviewPaperManpowerOut(BaseModel):
+    """单份卷的可用人力诊断（无解时返回）。"""
+
+    paper: int = Field(..., description="卷序号（从 0 起）")
+    required: int = Field(..., description="该卷所需审阅人数")
+    available_count: int = Field(..., description="未回避该卷的审阅人数")
+    available_reviewers: List[ReviewerId] = Field(
+        ..., description="未回避该卷的审阅人编号（规范排序）"
+    )
+    shortage: int = Field(
+        ..., description="人数缺口：max(0, required - available_count)"
+    )
+
+
+class ReviewPlanOut(BaseModel):
+    """盲审分配结果：可行方案或（无解时的）人力诊断，绝不返回部分方案。"""
+
+    task_id: int
+    status: str = Field(..., description="feasible / infeasible / error")
+    paper_count: int = Field(..., description="源任务的卷数")
+    reviewers_per_paper: int = Field(..., description="每卷所需审阅人数（回显请求）")
+    required_total: int = Field(
+        ..., description="总分配数：paper_count × reviewers_per_paper"
+    )
+
+    # —— 可行方案 ——
+    max_load: Optional[int] = Field(
+        None, description="最大个人负载（第 1 择优目标）"
+    )
+    assignments: Optional[List[ReviewAssignmentOut]] = Field(
+        None, description="逐卷分配结果（按卷号升序）"
+    )
+    loads: Optional[List[ReviewerLoadOut]] = Field(
+        None, description="各人负载（按审阅人编号规范排序）"
+    )
+
+    # —— 无解诊断（不返回任何部分方案）——
+    message: Optional[str] = None
+    capacity_total: Optional[int] = Field(
+        None, description="审阅人合计可承接卷数（每人按未回避卷数截断后求和）"
+    )
+    capacity_gap: Optional[int] = Field(
+        None, description="总容量缺口：max(0, required_total - capacity_total)"
+    )
+    papers: Optional[List[ReviewPaperManpowerOut]] = Field(
+        None, description="各卷可用人力（无解时返回）"
+    )
+    error: Optional[str] = None
