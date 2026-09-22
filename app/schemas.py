@@ -518,6 +518,113 @@ class TaskCreated(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# 盲审分配（POST /api/tasks/{task_id}/review-plan，同步求解）
+# --------------------------------------------------------------------------- #
+class ReviewerIn(BaseModel):
+    """单个审阅人：编号、个人容量（最多审几份卷）与不可审卷号（回避关系）。"""
+
+    id: QuestionId = Field(..., description="审阅人编号（数字或字符串，请求内唯一）")
+    capacity: int = Field(..., gt=0, description="个人容量：最多可审卷数（正整数，非正返回 422）")
+    forbidden_papers: List[int] = Field(
+        default_factory=list,
+        description="不可审卷号（卷序号从 0 起，与组卷结果 paper 下标一致；越界返回 422）",
+    )
+
+    @field_validator("forbidden_papers")
+    @classmethod
+    def _papers_nonneg(cls, v: List[int]) -> List[int]:
+        bad = [p for p in v if p < 0]
+        if bad:
+            raise ValueError(f"卷序号不能为负数: {bad}")
+        # 去重（保持首次出现顺序）：重复声明同一回避关系没有附加语义
+        return list(dict.fromkeys(v))
+
+
+class ReviewPlanIn(BaseModel):
+    """盲审分配请求：审阅人名单（编号/容量/回避卷号）与每卷所需审阅人数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reviewers: List[ReviewerIn] = Field(
+        ..., min_length=1, description="审阅人名单（编号不可重复，容量必须为正整数）"
+    )
+    required_per_paper: int = Field(
+        ..., gt=0, description="每份卷所需审阅人数（正整数；同卷审阅人不重复）"
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "ReviewPlanIn":
+        seen = set()
+        for rv in self.reviewers:
+            key = json.dumps(rv.id, ensure_ascii=False)
+            if key in seen:
+                raise ValueError(f"审阅人编号 {rv.id!r} 在请求中重复")
+            seen.add(key)
+        return self
+
+
+class ReviewPlanPaperOut(BaseModel):
+    """单份卷的盲审分配结果：审阅人编号按编号升序排列。"""
+
+    paper: int = Field(..., description="卷序号（从 0 起）")
+    reviewer_ids: List[QuestionId] = Field(
+        ..., description="该卷审阅人编号（升序，互不相同，恰为 required_per_paper 人）"
+    )
+
+
+class ReviewerLoadOut(BaseModel):
+    reviewer_id: QuestionId
+    load: int = Field(..., description="本次分配到的卷数（不超过其容量）")
+
+
+class ReviewPlanWorkloadOut(BaseModel):
+    """逐人负载与负载均衡指标（第 1/2 层择优目标值）。"""
+
+    max_load: int = Field(..., description="最大个人负载（第 1 择优目标，已最小化）")
+    average_load: float = Field(..., description="平均个人负载 = 总需求 / 审阅人数")
+    load_deviation_sum: float = Field(
+        ..., description="各人负载相对平均值的绝对偏差总和（第 2 择优目标，已最小化）"
+    )
+    reviewers: List[ReviewerLoadOut]
+
+
+class ReviewPlanPaperCapacityOut(BaseModel):
+    """无解诊断中单卷可用人力（已扣除回避关系）。"""
+
+    paper: int = Field(..., description="卷序号（从 0 起）")
+    required: int = Field(..., description="该卷需要的审阅人数")
+    available_count: int = Field(..., description="不回避该卷的审阅人总数")
+    available_reviewer_ids: List[QuestionId] = Field(
+        ..., description="可审该卷的审阅人编号（按编号升序）"
+    )
+    shortage: int = Field(..., description="该卷人力缺口：max(0, required - available_count)")
+
+
+class ReviewPlanResult(BaseModel):
+    """盲审分配结果：feasible 为完整方案；infeasible 为人力诊断（不含部分方案）。"""
+
+    status: str = Field(..., description="feasible / infeasible / error")
+
+    # —— 可行结果 ——
+    required_per_paper: Optional[int] = None
+    papers: Optional[List[ReviewPlanPaperOut]] = None
+    workload: Optional[ReviewPlanWorkloadOut] = None
+    total_demand: Optional[int] = Field(None, description="总需求 = 卷数 × 每卷所需人数")
+    total_capacity: Optional[int] = Field(None, description="全体审阅人容量之和")
+    seed: Optional[int] = None
+
+    # —— 无解诊断 ——
+    paper_capacities: Optional[List[ReviewPlanPaperCapacityOut]] = Field(
+        None, description="逐卷可用人力与缺口（回避关系已扣除）"
+    )
+    total_capacity_shortage: Optional[int] = Field(
+        None, description="总容量缺口：max(0, 总需求 - 容量总和)"
+    )
+    message: Optional[str] = None
+    error: Optional[str] = None
+
+
+# --------------------------------------------------------------------------- #
 # 防篡改审计链（GET /api/tasks/{task_id}/audit）
 # --------------------------------------------------------------------------- #
 class AuditEventOut(BaseModel):

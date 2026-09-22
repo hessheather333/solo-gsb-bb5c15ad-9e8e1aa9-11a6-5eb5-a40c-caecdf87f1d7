@@ -12,6 +12,8 @@
 
 另提供**题目曝光配额**模块（`PUT /api/quotas`）：按题号设置可用次数；创建任务时声明 `use_quota: true` 后，任务完成可行组卷即在 **SQLite 事务中按题号原子扣减**——并发任务串行化校验，任一题余额不足则整组不扣减、任务返回 `quota_exceeded` 及缺额明细；失败或无解任务不消耗配额，详见下文[题目曝光配额](#题目曝光配额use_quota)。
 
+还提供**盲审分配**模块（`POST /api/tasks/{task_id}/review-plan`）：对**已完成且可行**的组卷任务，按审阅人编号、个人容量、不可审卷号（回避关系）与每卷所需审阅人数，用 OR-Tools CP-SAT 在**同一个联合模型**中完成全卷分配，保证同卷审阅人不重复、回避关系与总容量均满足，并依次最小化**最大个人负载 → 各人负载相对平均值的绝对偏差总和 → 按卷号展平的审阅人编号序列**，结果可复现；无解时返回 `infeasible` 及逐卷可用人力与总容量缺口，**不返回任何部分方案**，详见下文[盲审分配](#盲审分配post-apitaskstask_idreview-plan)。
+
 每个异步任务还附带一条**防篡改审计链**（`GET /api/tasks/{task_id}/audit`）：任务创建、开始、完成或失败、配额结算均在**对应业务写入的同一 SQLite 事务内**追加哈希链接事件（规范化 JSON + SHA-256，含前驱哈希）；接口重放整条链并与任务/配额业务表交叉校验，发现序号、前驱哈希或内容摘要异常时返回**首个断点**，绝不伪报通过，详见下文[防篡改审计链](#防篡改审计链)。
 
 技术栈：Python · FastAPI · SQLite · OR-Tools CP-SAT · Docker / Compose。
@@ -47,6 +49,7 @@ EXAM_DB_PATH=./exam.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | `POST` | `/api/tasks` | 创建组卷任务（异步），返回 `task_id`；`use_quota: true` 时启用题目曝光配额 |
 | `POST` | `/api/tasks/{task_id}/revise` | 在已完成且可行的任务上创建**定向改卷**任务（异步） |
+| `POST` | `/api/tasks/{task_id}/review-plan` | 为已完成且可行的任务**同步求解盲审分配方案**（容量/回避/均衡） |
 | `GET`  | `/api/tasks/{task_id}/audit` | 查询任务的**防篡改审计事件链**及重放校验结论（首个断点） |
 | `GET`  | `/api/tasks/{task_id}` | 查询任务状态与结果（启用配额的任务附本次预留及剩余次数） |
 | `POST` | `/api/templates` | 创建组卷模板（不可变）；带 `base_template_id` 时创建该谱系的新版本 |
@@ -573,6 +576,107 @@ curl -X POST http://localhost:8000/api/tasks \
 ```
 
 补足配额（重新 `PUT /api/quotas`）后重新提交任务即可。
+
+## 盲审分配（`POST /api/tasks/{task_id}/review-plan`）
+
+对一份**已完成且可行**的组卷任务（单卷或 2~5 份平行卷；多候选任务以 `rank: 1` 候选为准）同步求解盲审分配：把全部卷在**同一个 CP-SAT 联合模型**中一次性分给审阅人，而不是逐卷贪心。
+
+- **源任务前置条件**：任务不存在返回 `404`；状态非 `done` 或结果不是 `feasible`（含 `infeasible` / `error` / `quota_exceeded`）返回 `422`。
+- **硬性约束**（全部满足才有解）：
+  - 每份卷恰好分配 `required_per_paper` 名审阅人，**同卷审阅人不重复**；
+  - **回避关系**：审阅人在 `forbidden_papers` 中声明的卷号上不会被分配；
+  - **总容量**：每名审阅人分到的卷数不超过其 `capacity`，且全体容量之和足以覆盖总需求（卷数 × 每卷人数）。
+- **字典序择优**（逐层最优后固定再优化下一层；源任务 `seed` 决定求解随机种子，单线程求解，**同请求结果可复现**）：
+  1. **最大个人负载**最小（尽量不让某一个人承担过多）；
+  2. **各人负载相对平均值的绝对偏差总和** `Σ |loadᵢ − 总需求/人数|` 最小（在最大负载相同的方案中进一步均摊）；
+  3. **按卷号展平的审阅人编号序列**最小：每份卷的审阅人编号先升序排列，再按卷序 `0,1,…` 依次拼接成序列取字典序最小（唯一破缺同卷审阅人的排列对称）。
+- 该接口为**同步求解**（不创建异步任务、不落库、不扣减配额、不写审计事件）；求解器在限时内无法判定时返回 `500`，不臆造方案。
+
+### 请求示例
+
+```bash
+curl -X POST http://localhost:8000/api/tasks/42/review-plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "reviewers": [
+      {"id": "T01", "capacity": 3, "forbidden_papers": [0]},
+      {"id": "T02", "capacity": 2, "forbidden_papers": []},
+      {"id": "T03", "capacity": 2, "forbidden_papers": [1, 2]},
+      {"id": 9,    "capacity": 3, "forbidden_papers": []}
+    ],
+    "required_per_paper": 2
+  }'
+```
+
+请求字段：
+
+- `reviewers`：非空审阅人名单。
+  - `id`：审阅人编号（数字或字符串，**请求内不可重复**；整数 `1` 与字符串 `"1"` 视为不同编号）；
+  - `capacity`：个人容量（最多审几份卷），**必须为正整数**（`0` / 负数返回 `422`）；
+  - `forbidden_papers`：不可审卷号列表（卷序号从 `0` 起，与组卷结果 `papers` 下标一致；**越界或负数返回 `422`**，重复卷号自动去重）。
+- `required_per_paper`：每份卷所需审阅人数，**正整数**；为 `0` / 负数返回 `422`。人数多于可调度人力时由求解判定无解（见下）。
+
+### 可行响应
+
+```json
+{
+  "status": "feasible",
+  "required_per_paper": 2,
+  "papers": [
+    {"paper": 0, "reviewer_ids": [9, "T02"]},
+    {"paper": 1, "reviewer_ids": [9, "T01"]},
+    {"paper": 2, "reviewer_ids": ["T01", "T03"]}
+  ],
+  "workload": {
+    "max_load": 2,
+    "average_load": 1.5,
+    "load_deviation_sum": 2.0,
+    "reviewers": [
+      {"reviewer_id": 9,    "load": 2},
+      {"reviewer_id": "T01", "load": 2},
+      {"reviewer_id": "T02", "load": 1},
+      {"reviewer_id": "T03", "load": 1}
+    ]
+  },
+  "total_demand": 6,
+  "total_capacity": 10,
+  "seed": 42
+}
+```
+
+- `papers`：逐卷分配结果，`reviewer_ids` 按编号升序、互不相同、恰为 `required_per_paper` 人；整数型编号按数值排在字符串型之前。
+- `workload.max_load`：最大个人负载（第 1 择优目标）；`average_load` 为 `总需求 / 审阅人数`；`load_deviation_sum` 为各人负载相对平均值的绝对偏差总和（第 2 择优目标）。
+- `total_demand` / `total_capacity`：总需求与全体容量之和；`seed` 为本次求解所用源任务种子。
+
+### 无解响应（`infeasible`，无部分方案）
+
+当回避关系或总容量导致**不存在**满足全部硬约束的完整方案时，返回 HTTP `200`、`status: "infeasible"`，逐卷给出已扣除回避关系后的可用人力与缺口，以及总容量缺口；**不会返回任何半成品分配**：
+
+```json
+{
+  "status": "infeasible",
+  "message": "不存在满足回避关系与总容量约束的盲审分配方案",
+  "paper_capacities": [
+    {"paper": 0, "required": 2, "available_count": 1,
+     "available_reviewer_ids": ["T03"], "shortage": 1},
+    {"paper": 1, "required": 2, "available_count": 3,
+     "available_reviewer_ids": [9, "T01", "T02"], "shortage": 0}
+  ],
+  "total_demand": 4,
+  "total_capacity": 3,
+  "total_capacity_shortage": 1
+}
+```
+
+- `paper_capacities[].available_reviewer_ids`：不回避该卷的审阅人编号（已按编号升序）；`shortage = max(0, required − available_count)` 为该卷人力缺口。
+- `total_capacity_shortage = max(0, 总需求 − 容量总和)`：总容量缺口（即使为 `0`，逐卷回避也可能导致无解，此时仍以逐卷 `shortage` 定位问题卷）。
+
+### 参数校验（`422`）
+
+- 审阅人编号重复（含整数 `1` 与字符串 `"1"` 之外的真重复）；
+- `forbidden_papers` 出现负数或不在源任务卷序号范围内的卷号；
+- `capacity` 或 `required_per_paper` 非正（`0` / 负数）；
+- 未知字段（`reviewers` / `required_per_paper` 之外的任何键）。
 
 ## 防篡改审计链
 

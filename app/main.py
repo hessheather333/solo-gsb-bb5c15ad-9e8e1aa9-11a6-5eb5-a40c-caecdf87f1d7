@@ -18,6 +18,12 @@ from .schemas import (
     QuotaOut,
     QuotaReservationOut,
     QuotaSetIn,
+    ReviewPlanIn,
+    ReviewPlanPaperCapacityOut,
+    ReviewPlanPaperOut,
+    ReviewPlanResult,
+    ReviewerLoadOut,
+    ReviewPlanWorkloadOut,
     ReviseTaskIn,
     TaskAuditOut,
     TaskCreated,
@@ -30,6 +36,7 @@ from .schemas import (
     TemplateTaskCreated,
     TemplateTaskIn,
 )
+from .review_solver import solve_review_plan
 from .worker import submit
 
 
@@ -45,9 +52,10 @@ app = FastAPI(
         "面向教研组的题库快照约束组卷服务（FastAPI + SQLite + OR-Tools CP-SAT），"
         "支持 2~5 份平行卷联合组卷、1~5 个差异化候选卷组，"
         "可版本化、创建后不可变的组卷模板，"
-        "以及按题号扣减的题目曝光配额"
+        "按题号扣减的题目曝光配额，"
+        "以及为已完成可行任务联合分配审阅人的盲审分配模块"
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -295,6 +303,114 @@ def revise_task(task_id: int, payload: ReviseTaskIn) -> TaskCreated:
     )
     submit(new_task_id)
     return TaskCreated(task_id=new_task_id, status="pending")
+
+
+def _feasible_paper_count(source_req: Dict[str, Any], source_result: Dict[str, Any]) -> int:
+    """可行组卷结果的卷数：多候选以排名第 1 的候选为准，缺省为单卷。"""
+    if source_result.get("papers"):
+        return len(source_result["papers"])
+    alts = source_result.get("alternatives")
+    if alts:
+        top = min(alts, key=lambda a: a.get("rank", 1))
+        if top.get("papers"):
+            return len(top["papers"])
+    return int(source_req.get("paper_count") or 1)
+
+
+@app.post(
+    "/api/tasks/{task_id}/review-plan",
+    response_model=ReviewPlanResult,
+    response_model_exclude_none=True,
+)
+def create_review_plan(task_id: int, payload: ReviewPlanIn) -> ReviewPlanResult:
+    """为已完成且可行的组卷任务同步求解盲审分配方案（OR-Tools CP-SAT 联合分配）。
+
+    源任务须为 ``done`` 且结果 ``feasible``：任务不存在返回 404，未完成或
+    结果不可行返回 422。每份卷恰好分配 ``required_per_paper`` 名审阅人，
+    满足同卷不重复、逐人回避（不可审卷号）与个人/总容量约束；依次最小化
+    最大个人负载、负载相对平均值的绝对偏差总和、按卷号展平的审阅人编号
+    序列，结果可复现。无解时返回 ``infeasible`` 及逐卷可用人力与总容量
+    缺口，**不返回任何部分方案**。
+
+    请求校验：审阅人编号重复、不可审卷号越界（含负数）、容量或每卷人数
+    非正均返回 422。
+    """
+    row = database.get_task(task_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if row["status"] != "done":
+        raise HTTPException(status_code=422, detail="源任务尚未完成，无法分配盲审")
+    if not row["result"]:
+        raise HTTPException(status_code=422, detail="源任务尚无结果，无法分配盲审")
+
+    source_result = json.loads(row["result"])
+    if source_result.get("status") != "feasible":
+        raise HTTPException(status_code=422, detail="源任务结果不可行，无法分配盲审")
+
+    source_req = json.loads(row["request"])
+    if source_req.get("kind") == "revise":
+        source_req = source_req["source_request"]
+    paper_count = _feasible_paper_count(source_req, source_result)
+
+    # 不可审卷号越界（负数已在 schema 层拒绝）：逐审阅人校验，明确指出编号与卷号
+    for rv in payload.reviewers:
+        bad = [p for p in rv.forbidden_papers if p >= paper_count]
+        if bad:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"审阅人 {rv.id!r} 的不可审卷号 {bad} 越界："
+                    f"源任务共 {paper_count} 份卷（卷序号 0~{paper_count - 1}）"
+                ),
+            )
+
+    result = solve_review_plan(
+        paper_count=paper_count,
+        reviewers=[rv.model_dump() for rv in payload.reviewers],
+        required=payload.required_per_paper,
+        seed=int(source_req.get("seed") or 42),
+    )
+    return _review_plan_out(result)
+
+
+def _review_plan_out(result: Dict[str, Any]) -> ReviewPlanResult:
+    """将求解器输出映射为响应模型：可行时聚合 workload 块，无解时映射诊断字段。"""
+    if result.get("status") == "feasible":
+        return ReviewPlanResult(
+            status="feasible",
+            required_per_paper=result["required_per_paper"],
+            papers=[
+                ReviewPlanPaperOut(paper=p["paper"], reviewer_ids=p["reviewer_ids"])
+                for p in result["papers"]
+            ],
+            workload=ReviewPlanWorkloadOut(
+                max_load=result["max_load"],
+                average_load=result["average_load"],
+                load_deviation_sum=result["load_deviation_sum"],
+                reviewers=[
+                    ReviewerLoadOut(
+                        reviewer_id=w["reviewer_id"], load=w["load"]
+                    )
+                    for w in result["workloads"]
+                ],
+            ),
+            total_demand=result["total_demand"],
+            total_capacity=result["total_capacity"],
+            seed=result["seed"],
+        )
+    if result.get("status") == "infeasible":
+        return ReviewPlanResult(
+            status="infeasible",
+            message=result.get("message"),
+            paper_capacities=[
+                ReviewPlanPaperCapacityOut(**p) for p in result["papers"]
+            ],
+            total_demand=result["total_demand"],
+            total_capacity=result["total_capacity"],
+            total_capacity_shortage=result["total_capacity_shortage"],
+        )
+    # 求解器无法在限时内判定：不臆造方案，按 500 暴露内部求解失败
+    raise HTTPException(status_code=500, detail=result.get("error") or "盲审分配求解失败")
 
 
 @app.get(
